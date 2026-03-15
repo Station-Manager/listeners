@@ -32,4 +32,12 @@ func TestInit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	service, err := container.ResolveSafe(ServiceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service == nil {
+		t.Fatal("service is nil")
+	}
 }
