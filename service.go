@@ -42,11 +42,11 @@ func (s *Service) Initialize() error {
 	var initErr error
 	s.initOnce.Do(func() {
 		if s.ConfigService == nil {
-			initErr = errors.New(op).Msg("ConfigService is nil")
+			initErr = errors.New(op).Msg(ErrNilConfigService)
 			return
 		}
 		if s.Logger == nil {
-			initErr = errors.New(op).Msg("LoggerService is nil")
+			initErr = errors.New(op).Msg(ErrNilLoggerService)
 			return
 		}
 
@@ -66,4 +66,20 @@ func (s *Service) Initialize() error {
 	})
 
 	return initErr
+}
+
+func (s *Service) Start() error {
+	const op errors.Op = "listeners.Service.Start"
+	if !s.initialized.Load() {
+		return errors.New(op).Msg(ErrServiceNotInitialized)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.started.Load() {
+		return nil
+	}
+
+	return nil
 }

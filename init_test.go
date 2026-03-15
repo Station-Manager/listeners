@@ -7,6 +7,7 @@ import (
 	"github.com/Station-Manager/config"
 	"github.com/Station-Manager/iocdi"
 	"github.com/Station-Manager/logging"
+	"github.com/Station-Manager/utils"
 )
 
 func TestInit(t *testing.T) {
@@ -23,7 +24,10 @@ func TestInit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workDir := t.TempDir()
+	workDir, err := utils.WorkingDir()
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = container.RegisterInstance("workingdir", workDir)
 	if err != nil {
 		t.Fatal(err)
