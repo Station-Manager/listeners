@@ -81,5 +81,18 @@ func (s *Service) Start() error {
 		return nil
 	}
 
+	if len(s.ListnerConfigs) < 1 {
+		s.Logger.InfoWith().Msg("No enabled listeners configured, skipping start")
+		return nil
+	}
+
+	for _, l := range s.ListnerConfigs {
+		ip := net.ParseIP(l.Host)
+		if ip == nil || ip.To4() == nil {
+			s.Logger.ErrorWith().Str("host", l.Host).Msg("Invalid IP address for listener")
+			continue
+		}
+	}
+
 	return nil
 }
