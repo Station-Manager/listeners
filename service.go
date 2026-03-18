@@ -1,7 +1,9 @@
 package listeners
 
 import (
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -12,7 +14,7 @@ import (
 )
 
 const (
-	ServiceName = "WSJT-X UDP Listener"
+	ServiceName = "udp_listener"
 )
 
 type runState struct {
@@ -21,9 +23,9 @@ type runState struct {
 }
 
 type Service struct {
-	ConfigService  *config.Service  `di.inject:"configservice"`
-	Logger         *logging.Service `di.inject:"loggingservice"`
-	ListnerConfigs []types.ListenerConfig
+	ConfigService   *config.Service  `di.inject:"configservice"`
+	Logger          *logging.Service `di.inject:"loggingservice"`
+	ListenerConfigs []types.ListenerConfig
 
 	initialized atomic.Bool
 	started     atomic.Bool
@@ -58,7 +60,7 @@ func (s *Service) Initialize() error {
 
 		for _, cfg := range cfgs {
 			if cfg.Enabled {
-				s.ListnerConfigs = append(s.ListnerConfigs, cfg)
+				s.ListenerConfigs = append(s.ListenerConfigs, cfg)
 			}
 		}
 
@@ -82,16 +84,26 @@ func (s *Service) Start() error {
 		return nil
 	}
 
-	if len(s.ListnerConfigs) < 1 {
+	if len(s.ListenerConfigs) < 1 {
 		s.Logger.InfoWith().Msg("No enabled listeners configured, skipping start")
 		return nil
 	}
 
-	for _, l := range s.ListnerConfigs {
-		ip := net.ParseIP(l.Host)
-		if ip == nil || ip.To4() == nil {
-			s.Logger.ErrorWith().Str("host", l.Host).Msg("Invalid IP address for listener")
-			continue
+	for _, l := range s.ListenerConfigs {
+		ip, err := getIP(l.Host)
+		if err != nil {
+			return errors.New(op).Msgf("failed to get IP for listener: %s", l.Host)
+		}
+		proto := strings.ToLower(l.Protocol)
+		switch proto {
+		case "udp":
+			_, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip.String(), l.Port))
+			if err != nil {
+				return errors.New(op).Msgf("failed to resolve UDP address for listener: %s", l.Host)
+			}
+		case "tcp":
+		default:
+			return errors.New(op).Msgf("unsupported protocol for listener: %s", l.Protocol)
 		}
 	}
 
