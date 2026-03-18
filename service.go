@@ -59,6 +59,10 @@ func (s *Service) Initialize() error {
 		}
 
 		for _, cfg := range cfgs {
+			if err = validateConfig(&cfg); err != nil {
+				s.Logger.ErrorWith().Err(err).Msgf("Invalid listener configuration: %v", cfg)
+				continue
+			}
 			if cfg.Enabled {
 				s.ListenerConfigs = append(s.ListenerConfigs, cfg)
 			}
