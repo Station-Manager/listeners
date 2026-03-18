@@ -1,6 +1,9 @@
 package listeners
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -29,8 +32,16 @@ func (suite *TestSuite) SetupTest() {
 	err = container.Register(ServiceName, reflect.TypeOf(&Service{}))
 	assert.NoError(suite.T(), err)
 
+	path, err := filepath.Abs(filepath.Join("..", "build"))
+	assert.NoError(suite.T(), err)
+
+	err = os.Setenv(utils.EnvSmWorkingDir, path)
+	assert.NoError(suite.T(), err)
+
 	workDir, err := utils.WorkingDir()
 	assert.NoError(suite.T(), err)
+
+	fmt.Println("Working Directory:", workDir)
 
 	err = container.RegisterInstance("workingdir", workDir)
 	assert.NoError(suite.T(), err)
@@ -53,6 +64,8 @@ func (suite *TestSuite) TestStart() {
 	service, err := container.ResolveSafe(ServiceName)
 	assert.NoError(suite.T(), err)
 	assert.NotNil(suite.T(), service)
+	err = service.(*Service).Start()
+	assert.NoError(suite.T(), err)
 	err = service.(*Service).Start()
 	assert.NoError(suite.T(), err)
 }

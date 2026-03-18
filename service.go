@@ -78,6 +78,7 @@ func (s *Service) Start() error {
 	defer s.mu.Unlock()
 
 	if s.started.Load() {
+		s.Logger.InfoWith().Msg("Listeners already started, skipping start")
 		return nil
 	}
 
@@ -93,6 +94,8 @@ func (s *Service) Start() error {
 			continue
 		}
 	}
+
+	s.started.Store(true)
 
 	return nil
 }
