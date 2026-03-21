@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	ServiceName        = "listeners"
+	ServiceName        = types.ListenersServiceName
 	stopTimeoutSeconds = 5
 )
 
@@ -94,6 +94,14 @@ type resolvedListener struct {
 	proto   string
 	udpAddr *net.UDPAddr
 	tcpAddr *net.TCPAddr
+}
+
+// boundListener holds a resolved listener with its pre-bound connection/listener.
+// This enables atomic startup: bind everything first, then launch goroutines.
+type boundListener struct {
+	resolved resolvedListener
+	udpConn  *net.UDPConn     // set for UDP
+	tcpLn    *net.TCPListener // set for TCP
 }
 
 func (s *Service) getState() serviceState {
@@ -214,7 +222,16 @@ func (s *Service) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Phase 3: Create runState and launch listeners (transactional)
+	// Phase 3: Bind all listeners BEFORE launching any goroutines.
+	// This is the key to atomic startup: if any bind fails, we close
+	// all already-bound listeners and return an error with no goroutines running.
+	bound, err := s.bindAllListeners(op, resolved)
+	if err != nil {
+		s.setState(stateInitialized)
+		return err
+	}
+
+	// Phase 4: All binds succeeded. Now launch goroutines (cannot fail).
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -223,77 +240,122 @@ func (s *Service) Start(ctx context.Context) error {
 		activeConns:     make(map[string]closer),
 	}
 
-	// Launch all listeners. Track success so we can rollback if needed.
-	launchErr := s.launchAllListeners(run, resolved, ctx)
-	if launchErr != nil {
-		// Rollback: shutdown any goroutines that were started
-		s.rollbackStart(run)
-		s.setState(stateInitialized)
-		return errors.New(op).Err(launchErr).Msg("failed to launch listeners, rolled back")
-	}
-
-	// Success: commit the runState and transition to running
-	s.currentRun = run
-	s.setState(stateRunning)
-	s.Logger.InfoWith().Int("count", len(resolved)).Msg("All listeners started")
-
-	return nil
-}
-
-// launchAllListeners launches all listener goroutines.
-// Returns an error if any launch fails (currently not possible, but future-proofed).
-// The caller must handle rollback if this returns an error.
-func (s *Service) launchAllListeners(run *runState, resolved []resolvedListener, ctx context.Context) error {
-	for _, rl := range resolved {
-		switch rl.proto {
+	for _, bl := range bound {
+		switch bl.resolved.proto {
 		case "udp":
-			s.Logger.InfoWith().Str("name", rl.config.Name).Str("addr", rl.udpAddr.String()).Msg("Launching UDP listener")
-			s.launchListenerThread(run, rl, ctx, s.udpListener)
+			s.Logger.InfoWith().
+				Str("name", bl.resolved.config.Name).
+				Str("addr", bl.resolved.udpAddr.String()).
+				Msg("Starting UDP listener goroutine")
+			s.launchUDPListenerWithConn(run, bl.resolved, bl.udpConn, ctx)
 		case "tcp":
-			s.Logger.InfoWith().Str("name", rl.config.Name).Str("addr", rl.tcpAddr.String()).Msg("Launching TCP listener")
-			s.launchListenerThread(run, rl, ctx, s.tcpListener)
-		default:
-			// This should be unreachable due to normalizeConfigs validation
-			return fmt.Errorf("BUG: unhandled protocol in launch phase: %s", rl.proto)
+			s.Logger.InfoWith().
+				Str("name", bl.resolved.config.Name).
+				Str("addr", bl.resolved.tcpAddr.String()).
+				Msg("Starting TCP listener goroutine")
+			s.launchTCPListenerWithConn(run, bl.resolved, bl.tcpLn, ctx)
 		}
 	}
+
+	// Commit: all goroutines launched successfully
+	s.currentRun = run
+	s.setState(stateRunning)
+	s.Logger.InfoWith().Int("count", len(bound)).Msg("All listeners started")
+
 	return nil
 }
 
-// rollbackStart performs cleanup when Start() fails after launching some goroutines.
-// It signals shutdown and waits for all started goroutines to exit.
-func (s *Service) rollbackStart(run *runState) {
-	s.Logger.WarnWith().Msg("Rolling back partial startup...")
+// bindAllListeners binds all resolved listeners to their network addresses.
+// If any bind fails, all already-bound listeners are closed and an error is returned.
+// This enables atomic startup with no partially running state.
+func (s *Service) bindAllListeners(op errors.Op, resolved []resolvedListener) ([]boundListener, error) {
+	bound := make([]boundListener, 0, len(resolved))
 
-	// Signal shutdown
-	run.stopOnce.Do(func() {
-		close(run.shutdownChannel)
-	})
-
-	// Close any connections that were registered
-	run.connsMu.Lock()
-	for _, conn := range run.activeConns {
-		_ = conn.Close()
+	// Cleanup function to close all bound listeners on failure
+	cleanup := func() {
+		for _, bl := range bound {
+			if bl.udpConn != nil {
+				_ = bl.udpConn.Close()
+			}
+			if bl.tcpLn != nil {
+				_ = bl.tcpLn.Close()
+			}
+		}
 	}
-	clear(run.activeConns)
-	run.connsMu.Unlock()
 
-	// Wait for goroutines with timeout
-	done := make(chan struct{})
+	for _, rl := range resolved {
+		bl := boundListener{resolved: rl}
+
+		switch rl.proto {
+		case "udp":
+			conn, err := net.ListenUDP("udp", rl.udpAddr)
+			if err != nil {
+				cleanup()
+				return nil, errors.New(op).Err(err).Msgf("failed to bind UDP listener %s on %s", rl.config.Name, rl.udpAddr.String())
+			}
+			bl.udpConn = conn
+			s.Logger.DebugWith().Str("name", rl.config.Name).Str("addr", rl.udpAddr.String()).Msg("UDP listener bound")
+
+		case "tcp":
+			ln, err := net.ListenTCP("tcp", rl.tcpAddr)
+			if err != nil {
+				cleanup()
+				return nil, errors.New(op).Err(err).Msgf("failed to bind TCP listener %s on %s", rl.config.Name, rl.tcpAddr.String())
+			}
+			bl.tcpLn = ln
+			s.Logger.DebugWith().Str("name", rl.config.Name).Str("addr", rl.tcpAddr.String()).Msg("TCP listener bound")
+
+		default:
+			cleanup()
+			return nil, errors.New(op).Msgf("BUG: unhandled protocol in bind phase: %s", rl.proto)
+		}
+
+		bound = append(bound, bl)
+	}
+
+	return bound, nil
+}
+
+// launchUDPListenerWithConn starts a UDP listener goroutine with a pre-bound connection.
+func (s *Service) launchUDPListenerWithConn(run *runState, rl resolvedListener, conn *net.UDPConn, ctx context.Context) {
+	workerName := fmt.Sprintf("udp_%s", rl.config.Name)
+
+	run.wg.Add(1)
 	go func() {
-		run.wg.Wait()
-		close(done)
+		defer run.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.Logger.ErrorWith().
+					Str("worker", workerName).
+					Str("panic", fmt.Sprintf("%v", r)).
+					Msg("Listener panicked")
+			}
+		}()
+		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener starting")
+		s.runUDPListener(run, rl, conn, ctx)
+		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener stopped")
 	}()
+}
 
-	timer := time.NewTimer(stopTimeoutSeconds * time.Second)
-	defer timer.Stop()
+// launchTCPListenerWithConn starts a TCP listener goroutine with a pre-bound listener.
+func (s *Service) launchTCPListenerWithConn(run *runState, rl resolvedListener, ln *net.TCPListener, ctx context.Context) {
+	workerName := fmt.Sprintf("tcp_%s", rl.config.Name)
 
-	select {
-	case <-done:
-		s.Logger.InfoWith().Msg("Rollback complete, all goroutines stopped")
-	case <-timer.C:
-		s.Logger.WarnWith().Msg("Rollback timeout, some goroutines may still be running")
-	}
+	run.wg.Add(1)
+	go func() {
+		defer run.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.Logger.ErrorWith().
+					Str("worker", workerName).
+					Str("panic", fmt.Sprintf("%v", r)).
+					Msg("Listener panicked")
+			}
+		}()
+		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener starting")
+		s.runTCPListener(run, rl, ln, ctx)
+		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener stopped")
+	}()
 }
 
 // normalizeConfigs prepares configs for resolution by normalizing protocol and host values.

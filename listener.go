@@ -19,15 +19,9 @@ const (
 	defaultReadDeadlineMS = 500
 )
 
-func (s *Service) udpListener(run *runState, rl resolvedListener, ctx context.Context) {
+func (s *Service) runUDPListener(run *runState, rl resolvedListener, conn *net.UDPConn, ctx context.Context) {
 	cfg := rl.config
 	addr := rl.udpAddr
-
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		s.Logger.ErrorWith().Err(err).Str("name", cfg.Name).Str("address", addr.String()).Msg("failed to start UDP listener")
-		return
-	}
 
 	// Register connection for forceful shutdown
 	connID := "udp:" + addr.String()
@@ -94,27 +88,25 @@ func (s *Service) udpListener(run *runState, rl resolvedListener, ctx context.Co
 // handleUDPPacket processes incoming UDP data.
 // UDP is message-oriented, so each read is a complete datagram.
 func (s *Service) handleUDPPacket(cfg types.ListenerConfig, data []byte, remoteAddr *net.UDPAddr) {
-	preview := safeDataPreview(data, 32)
-
-	s.Logger.DebugWith().
+	// Always log safe metadata (length, source)
+	logEntry := s.Logger.DebugWith().
 		Str("name", cfg.Name).
 		Str("remote", remoteAddr.String()).
-		Int("len", len(data)).
-		Str("preview", preview).
-		Msg("processing UDP packet")
+		Int("len", len(data))
+
+	// Only log payload preview when explicitly enabled
+	if cfg.LogPayload {
+		logEntry = logEntry.Str("preview", safeDataPreview(data, 32))
+	}
+
+	logEntry.Msg("processing UDP packet")
 
 	// TODO: Implement protocol-specific parsing (e.g., WSJT-X, N1MM, etc.)
 }
 
-func (s *Service) tcpListener(run *runState, rl resolvedListener, ctx context.Context) {
+func (s *Service) runTCPListener(run *runState, rl resolvedListener, listener *net.TCPListener, ctx context.Context) {
 	cfg := rl.config
 	addr := rl.tcpAddr
-
-	listener, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		s.Logger.ErrorWith().Err(err).Str("name", cfg.Name).Str("address", addr.String()).Msg("failed to start TCP listener")
-		return
-	}
 
 	// Register listener for forceful shutdown
 	listenerID := "tcp-listener:" + addr.String()
@@ -251,14 +243,18 @@ func (s *Service) handleTCPConnection(cfg types.ListenerConfig, conn *net.TCPCon
 // handleTCPData processes incoming TCP data.
 // See handleTCPConnection for notes on TCP framing.
 func (s *Service) handleTCPData(cfg types.ListenerConfig, data []byte, conn *net.TCPConn) {
-	preview := safeDataPreview(data, 32)
-
-	s.Logger.DebugWith().
+	// Always log safe metadata (length, source)
+	logEntry := s.Logger.DebugWith().
 		Str("name", cfg.Name).
 		Str("remote", conn.RemoteAddr().String()).
-		Int("len", len(data)).
-		Str("preview", preview).
-		Msg("processing TCP data")
+		Int("len", len(data))
+
+	// Only log payload preview when explicitly enabled
+	if cfg.LogPayload {
+		logEntry = logEntry.Str("preview", safeDataPreview(data, 32))
+	}
+
+	logEntry.Msg("processing TCP data")
 
 	// TODO: Implement protocol-specific parsing with proper message framing
 }
