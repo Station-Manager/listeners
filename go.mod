@@ -3,12 +3,13 @@ module github.com/Station-Manager/listeners
 go 1.25.0
 
 require (
-	github.com/Station-Manager/config v0.0.45
+	github.com/Station-Manager/config v0.0.47
 	github.com/Station-Manager/errors v0.0.11
 	github.com/Station-Manager/iocdi v0.0.1
 	github.com/Station-Manager/logging v0.0.13
-	github.com/Station-Manager/types v0.0.83
+	github.com/Station-Manager/types v0.0.85
 	github.com/Station-Manager/utils v0.0.6
+	github.com/go-playground/validator/v10 v10.30.1
 	github.com/stretchr/testify v1.11.1
 )
 
@@ -19,7 +20,6 @@ require (
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
-	github.com/go-playground/validator/v10 v10.30.1 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
