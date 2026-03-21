@@ -1,11 +1,13 @@
 package listeners
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Station-Manager/config"
 	"github.com/Station-Manager/iocdi"
@@ -64,8 +66,13 @@ func (suite *TestSuite) TestStart() {
 	service, err := container.ResolveSafe(ServiceName)
 	assert.NoError(suite.T(), err)
 	assert.NotNil(suite.T(), service)
-	err = service.(*Service).Start()
+	err = service.(*Service).Start(context.Background())
 	assert.NoError(suite.T(), err)
-	err = service.(*Service).Start()
+	err = service.(*Service).Start(context.Background())
+	assert.NoError(suite.T(), err)
+
+	time.Sleep(2000 * time.Millisecond)
+
+	err = service.(*Service).Stop()
 	assert.NoError(suite.T(), err)
 }

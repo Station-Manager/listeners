@@ -1,6 +1,7 @@
 package listeners
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -74,7 +75,7 @@ func (s *Service) Initialize() error {
 	return initErr
 }
 
-func (s *Service) Start() error {
+func (s *Service) Start(ctx context.Context) error {
 	const op errors.Op = "listeners.Service.Start"
 	if !s.initialized.Load() {
 		return errors.New(op).Msg(ErrServiceNotInitialized)
@@ -93,6 +94,11 @@ func (s *Service) Start() error {
 		return nil
 	}
 
+	run := &runState{
+		shutdownChannel: make(chan struct{}),
+	}
+	s.currentRun = run
+
 	for _, l := range s.ListenerConfigs {
 		ip, err := getIP(l.Host)
 		if err != nil {
@@ -101,10 +107,11 @@ func (s *Service) Start() error {
 		proto := strings.ToLower(l.Protocol)
 		switch proto {
 		case "udp":
-			_, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip.String(), l.Port))
+			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip.String(), l.Port))
 			if err != nil {
 				return errors.New(op).Msgf("failed to resolve UDP address for listener: %s", l.Host)
 			}
+			s.launchListenerThread(run, l, ctx, s.udpListener, fmt.Sprintf("udp_listener_%s", addr.String()))
 		case "tcp":
 		default:
 			return errors.New(op).Msgf("unsupported protocol for listener: %s", l.Protocol)
@@ -113,5 +120,36 @@ func (s *Service) Start() error {
 
 	s.started.Store(true)
 
+	return nil
+}
+
+func (s *Service) Stop() error {
+	const op errors.Op = "listeners.Service.Stop"
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.started.Load() {
+		s.Logger.InfoWith().Msg("Listeners not started, skipping stop")
+		return nil
+	}
+
+	run := s.currentRun
+	if run == nil {
+		return nil
+	}
+
+	s.Logger.InfoWith().Msg("Stopping listeners...")
+
+	// Signal all listener goroutines to shutdown
+	close(run.shutdownChannel)
+
+	// Wait for all goroutines to finish
+	run.wg.Wait()
+
+	s.currentRun = nil
+	s.started.Store(false)
+
+	s.Logger.InfoWith().Msg("All listeners stopped")
 	return nil
 }
