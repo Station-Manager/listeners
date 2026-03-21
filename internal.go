@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
-
-	"github.com/Station-Manager/types"
 )
 
 // listenerFunc is the signature for listener goroutine functions.
-type listenerFunc func(run *runState, cfg types.ListenerConfig, ctx context.Context)
+// It receives the resolved listener info with pre-resolved addresses.
+type listenerFunc func(run *runState, rl resolvedListener, ctx context.Context)
 
-func (s *Service) launchListenerThread(run *runState, cfg types.ListenerConfig, ctx context.Context, fn listenerFunc, workerName string) {
+func (s *Service) launchListenerThread(run *runState, rl resolvedListener, ctx context.Context, fn listenerFunc) {
+	workerName := fmt.Sprintf("%s_%s", rl.proto, rl.config.Name)
+
 	run.wg.Add(1)
 	go func() {
 		defer run.wg.Done()
@@ -25,7 +26,7 @@ func (s *Service) launchListenerThread(run *runState, cfg types.ListenerConfig, 
 			}
 		}()
 		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener starting")
-		fn(run, cfg, ctx)
+		fn(run, rl, ctx)
 		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener stopped")
 	}()
 }

@@ -4,8 +4,6 @@ import (
 	"encoding/hex"
 	"net"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/Station-Manager/errors"
 )
@@ -32,15 +30,15 @@ func getIP(address string) (net.IP, error) {
 }
 
 // safeDataPreview returns a safe, truncated preview of data for logging.
-// If data is printable ASCII/UTF-8, returns the string (truncated if needed).
-// If data contains binary/non-printable bytes, returns a hex preview.
+// Uses ASCII-only for network protocol data to avoid confusing Unicode output.
+// If data contains non-printable ASCII, returns a hex preview.
 func safeDataPreview(data []byte, maxLen int) string {
 	if len(data) == 0 {
 		return "<empty>"
 	}
 
-	// Check if data is printable
-	if isPrintable(data) {
+	// Check if data is printable ASCII
+	if isPrintableASCII(data) {
 		if len(data) <= maxLen {
 			return string(data)
 		}
@@ -50,19 +48,21 @@ func safeDataPreview(data []byte, maxLen int) string {
 	// Binary data: show hex preview
 	previewLen := maxLen / 2 // hex encoding doubles length
 	if len(data) > previewLen {
-		return hex.EncodeToString(data[:previewLen]) + "... (binary)"
+		return hex.EncodeToString(data[:previewLen]) + "...(bin)"
 	}
-	return hex.EncodeToString(data) + " (binary)"
+	return hex.EncodeToString(data) + "(bin)"
 }
 
-// isPrintable checks if data consists of printable UTF-8 characters.
-func isPrintable(data []byte) bool {
-	if !utf8.Valid(data) {
-		return false
-	}
-	for _, r := range string(data) {
-		if !unicode.IsPrint(r) && !unicode.IsSpace(r) {
-			return false
+// isPrintableASCII checks if data consists only of printable ASCII characters.
+// This is more restrictive than isPrintable but safer for network protocol logging.
+func isPrintableASCII(data []byte) bool {
+	for _, b := range data {
+		// Printable ASCII range: 0x20 (space) to 0x7E (~), plus common whitespace
+		if b < 0x20 || b > 0x7E {
+			// Allow tab, newline, carriage return
+			if b != '\t' && b != '\n' && b != '\r' {
+				return false
+			}
 		}
 	}
 	return true
