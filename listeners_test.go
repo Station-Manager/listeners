@@ -15,6 +15,9 @@ import (
 	"github.com/Station-Manager/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
+
+	// Register packet handlers for testing
+	_ "github.com/Station-Manager/listeners/handlers/wsjtx"
 )
 
 type TestSuite struct {

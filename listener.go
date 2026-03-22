@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Station-Manager/listeners/handlers"
 	"github.com/Station-Manager/types"
 )
 
@@ -19,7 +20,7 @@ const (
 	defaultReadDeadlineMS = 500
 )
 
-func (s *Service) runUDPListener(run *runState, rl resolvedListener, conn *net.UDPConn, ctx context.Context) {
+func (s *Service) runUDPListener(ctx context.Context, run *runState, rl resolvedListener, conn *net.UDPConn, handler handlers.PacketHandler) {
 	cfg := rl.config
 	addr := rl.udpAddr
 
@@ -29,7 +30,7 @@ func (s *Service) runUDPListener(run *runState, rl resolvedListener, conn *net.U
 	defer run.unregisterConn(connID)
 
 	defer func() {
-		if cerr := conn.Close(); cerr != nil {
+		if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
 			s.Logger.ErrorWith().Err(cerr).Str("name", cfg.Name).Msg("failed to close UDP listener")
 		}
 	}()
@@ -80,14 +81,14 @@ func (s *Service) runUDPListener(run *runState, rl resolvedListener, conn *net.U
 				Int("bytes", n).
 				Msg("UDP packet received")
 
-			s.handleUDPPacket(cfg, data, remoteAddr)
+			s.handleUDPPacket(cfg, data, remoteAddr, conn.LocalAddr(), handler)
 		}
 	}
 }
 
 // handleUDPPacket processes incoming UDP data.
 // UDP is message-oriented, so each read is a complete datagram.
-func (s *Service) handleUDPPacket(cfg types.ListenerConfig, data []byte, remoteAddr *net.UDPAddr) {
+func (s *Service) handleUDPPacket(cfg types.ListenerConfig, data []byte, remoteAddr *net.UDPAddr, localAddr net.Addr, handler handlers.PacketHandler) {
 	// Always log safe metadata (length, source)
 	logEntry := s.Logger.DebugWith().
 		Str("name", cfg.Name).
@@ -101,10 +102,30 @@ func (s *Service) handleUDPPacket(cfg types.ListenerConfig, data []byte, remoteA
 
 	logEntry.Msg("processing UDP packet")
 
-	// TODO: Implement protocol-specific parsing (e.g., WSJT-X, N1MM, etc.)
+	// If no handler configured, just log the packet
+	if handler == nil {
+		s.Logger.DebugWith().Str("name", cfg.Name).Msg("no handler configured, packet logged only")
+		return
+	}
+
+	// Build packet and dispatch to handler
+	pkt := handlers.Packet{
+		Data:         data,
+		RemoteAddr:   remoteAddr,
+		LocalAddr:    localAddr,
+		Protocol:     "udp",
+		ListenerName: cfg.Name,
+	}
+
+	if err := handler.Handle(pkt); err != nil {
+		s.Logger.ErrorWith().Err(err).
+			Str("name", cfg.Name).
+			Str("handler", handler.Name()).
+			Msg("handler error processing packet")
+	}
 }
 
-func (s *Service) runTCPListener(run *runState, rl resolvedListener, listener *net.TCPListener, ctx context.Context) {
+func (s *Service) runTCPListener(ctx context.Context, run *runState, rl resolvedListener, listener *net.TCPListener, handler handlers.PacketHandler) {
 	cfg := rl.config
 	addr := rl.tcpAddr
 
@@ -114,7 +135,7 @@ func (s *Service) runTCPListener(run *runState, rl resolvedListener, listener *n
 	defer run.unregisterConn(listenerID)
 
 	defer func() {
-		if cerr := listener.Close(); cerr != nil {
+		if cerr := listener.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
 			s.Logger.ErrorWith().Err(cerr).Str("name", cfg.Name).Msg("failed to close TCP listener")
 		}
 	}()
@@ -173,7 +194,7 @@ func (s *Service) runTCPListener(run *runState, rl resolvedListener, listener *n
 			go func(c *net.TCPConn, id string) {
 				defer connWg.Done()
 				defer run.unregisterConn(id)
-				s.handleTCPConnection(cfg, c, connCtx)
+				s.handleTCPConnection(connCtx, cfg, c, handler)
 			}(conn, connID)
 		}
 	}
@@ -183,7 +204,7 @@ func (s *Service) runTCPListener(run *runState, rl resolvedListener, listener *n
 // NOTE: TCP is a stream protocol. This implementation treats each read as independent data,
 // which works for simple line-based protocols but may need a framing layer for protocols
 // with message boundaries (length-prefixed, delimiter-based, etc.).
-func (s *Service) handleTCPConnection(cfg types.ListenerConfig, conn *net.TCPConn, ctx context.Context) {
+func (s *Service) handleTCPConnection(ctx context.Context, cfg types.ListenerConfig, conn *net.TCPConn, handler handlers.PacketHandler) {
 	remoteAddr := conn.RemoteAddr().String()
 
 	s.Logger.DebugWith().
@@ -192,7 +213,7 @@ func (s *Service) handleTCPConnection(cfg types.ListenerConfig, conn *net.TCPCon
 		Msg("TCP connection accepted")
 
 	defer func() {
-		if err := conn.Close(); err != nil {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.Logger.ErrorWith().Err(err).Str("name", cfg.Name).Str("remote", remoteAddr).Msg("failed to close TCP connection")
 		}
 		s.Logger.DebugWith().Str("name", cfg.Name).Str("remote", remoteAddr).Msg("TCP connection closed")
@@ -235,14 +256,14 @@ func (s *Service) handleTCPConnection(cfg types.ListenerConfig, conn *net.TCPCon
 				Int("bytes", n).
 				Msg("TCP data received")
 
-			s.handleTCPData(cfg, data, conn)
+			s.handleTCPData(cfg, data, conn, handler)
 		}
 	}
 }
 
 // handleTCPData processes incoming TCP data.
 // See handleTCPConnection for notes on TCP framing.
-func (s *Service) handleTCPData(cfg types.ListenerConfig, data []byte, conn *net.TCPConn) {
+func (s *Service) handleTCPData(cfg types.ListenerConfig, data []byte, conn *net.TCPConn, handler handlers.PacketHandler) {
 	// Always log safe metadata (length, source)
 	logEntry := s.Logger.DebugWith().
 		Str("name", cfg.Name).
@@ -256,5 +277,25 @@ func (s *Service) handleTCPData(cfg types.ListenerConfig, data []byte, conn *net
 
 	logEntry.Msg("processing TCP data")
 
-	// TODO: Implement protocol-specific parsing with proper message framing
+	// If no handler configured, just log the data
+	if handler == nil {
+		s.Logger.DebugWith().Str("name", cfg.Name).Msg("no handler configured, data logged only")
+		return
+	}
+
+	// Build packet and dispatch to handler
+	pkt := handlers.Packet{
+		Data:         data,
+		RemoteAddr:   conn.RemoteAddr(),
+		LocalAddr:    conn.LocalAddr(),
+		Protocol:     "tcp",
+		ListenerName: cfg.Name,
+	}
+
+	if err := handler.Handle(pkt); err != nil {
+		s.Logger.ErrorWith().Err(err).
+			Str("name", cfg.Name).
+			Str("handler", handler.Name()).
+			Msg("handler error processing data")
+	}
 }

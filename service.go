@@ -11,6 +11,7 @@ import (
 
 	"github.com/Station-Manager/config"
 	"github.com/Station-Manager/errors"
+	"github.com/Station-Manager/listeners/handlers"
 	"github.com/Station-Manager/logging"
 	"github.com/Station-Manager/types"
 	"github.com/go-playground/validator/v10"
@@ -80,6 +81,7 @@ type Service struct {
 	// Lifecycle state machine
 	state    atomic.Int32 // holds serviceState
 	initOnce sync.Once
+	initErr  error      // stores initialization error for subsequent calls
 	mu       sync.Mutex // protects state transitions and currentRun
 
 	currentRun *runState
@@ -100,8 +102,9 @@ type resolvedListener struct {
 // This enables atomic startup: bind everything first, then launch goroutines.
 type boundListener struct {
 	resolved resolvedListener
-	udpConn  *net.UDPConn     // set for UDP
-	tcpLn    *net.TCPListener // set for TCP
+	udpConn  *net.UDPConn           // set for UDP
+	tcpLn    *net.TCPListener       // set for TCP
+	handler  handlers.PacketHandler // packet handler for this listener (may be nil)
 }
 
 func (s *Service) getState() serviceState {
@@ -121,14 +124,13 @@ func (s *Service) compareAndSwapState(old, new serviceState) bool {
 func (s *Service) Initialize() error {
 	const op errors.Op = "listeners.Service.Initialize"
 
-	var initErr error
 	s.initOnce.Do(func() {
 		if s.ConfigService == nil {
-			initErr = errors.New(op).Msg(ErrNilConfigService)
+			s.initErr = errors.New(op).Msg(ErrNilConfigService)
 			return
 		}
 		if s.Logger == nil {
-			initErr = errors.New(op).Msg(ErrNilLoggerService)
+			s.initErr = errors.New(op).Msg(ErrNilLoggerService)
 			return
 		}
 
@@ -137,7 +139,7 @@ func (s *Service) Initialize() error {
 
 		cfgs, err := s.ConfigService.ListenerConfigs()
 		if err != nil {
-			initErr = errors.New(op).Err(err).Msg("failed to load listener configurations")
+			s.initErr = errors.New(op).Err(err).Msg("failed to load listener configurations")
 			return
 		}
 
@@ -167,7 +169,8 @@ func (s *Service) Initialize() error {
 		s.setState(stateInitialized)
 	})
 
-	return initErr
+	// Return stored error on all calls (nil if initialization succeeded)
+	return s.initErr
 }
 
 // validateConfig validates a listener configuration using the Service's validator.
@@ -178,6 +181,25 @@ func (s *Service) validateConfig(cfg *types.ListenerConfig) error {
 	return s.validate.Struct(cfg)
 }
 
+// Start begins listening on all configured network listeners.
+//
+// The method transitions through several phases:
+//  1. Normalize and validate configurations
+//  2. Resolve network addresses (may involve DNS lookups)
+//  3. Bind all listeners atomically (if any bind fails, all are rolled back)
+//  4. Launch listener goroutines
+//
+// Context Cancellation:
+// The provided context is passed to listener goroutines. If the context is cancelled,
+// all listener goroutines will exit, but the service state remains stateRunning.
+// This is intentional - the service does not automatically transition state on context
+// cancellation. Callers MUST call Stop() to properly clean up and reset state before
+// calling Start() again. A subsequent Start() call while in stateRunning will return
+// nil with a log message "already running".
+//
+// Thread Safety:
+// Start() is safe to call concurrently with Stop(). If Stop() is called during startup
+// (phases 1-3), Start() will detect this and abort without launching goroutines.
 func (s *Service) Start(ctx context.Context) error {
 	const op errors.Op = "listeners.Service.Start"
 
@@ -235,6 +257,26 @@ func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Check if Stop() was called during Phase 1-3 (race condition mitigation).
+	// Stop() sets state to stateStopping, so check for that or stateStopped.
+	// If so, clean up bound listeners and abort without launching goroutines.
+	currentState := s.getState()
+	if currentState == stateStopping || currentState == stateStopped {
+		s.Logger.WarnWith().Msg("Stop() was called during startup, aborting Start()")
+		for _, bl := range bound {
+			if bl.handler != nil {
+				_ = bl.handler.Close()
+			}
+			if bl.udpConn != nil {
+				_ = bl.udpConn.Close()
+			}
+			if bl.tcpLn != nil {
+				_ = bl.tcpLn.Close()
+			}
+		}
+		return errors.New(op).Msg("service was stopped during startup")
+	}
+
 	run := &runState{
 		shutdownChannel: make(chan struct{}),
 		activeConns:     make(map[string]closer),
@@ -247,13 +289,13 @@ func (s *Service) Start(ctx context.Context) error {
 				Str("name", bl.resolved.config.Name).
 				Str("addr", bl.resolved.udpAddr.String()).
 				Msg("Starting UDP listener goroutine")
-			s.launchUDPListenerWithConn(run, bl.resolved, bl.udpConn, ctx)
+			s.launchUDPListenerWithConn(ctx, run, bl.resolved, bl.udpConn, bl.handler)
 		case "tcp":
 			s.Logger.InfoWith().
 				Str("name", bl.resolved.config.Name).
 				Str("addr", bl.resolved.tcpAddr.String()).
 				Msg("Starting TCP listener goroutine")
-			s.launchTCPListenerWithConn(run, bl.resolved, bl.tcpLn, ctx)
+			s.launchTCPListenerWithConn(ctx, run, bl.resolved, bl.tcpLn, bl.handler)
 		}
 	}
 
@@ -271,9 +313,12 @@ func (s *Service) Start(ctx context.Context) error {
 func (s *Service) bindAllListeners(op errors.Op, resolved []resolvedListener) ([]boundListener, error) {
 	bound := make([]boundListener, 0, len(resolved))
 
-	// Cleanup function to close all bound listeners on failure
+	// Cleanup function to close all bound listeners and handlers on failure
 	cleanup := func() {
 		for _, bl := range bound {
+			if bl.handler != nil {
+				_ = bl.handler.Close()
+			}
 			if bl.udpConn != nil {
 				_ = bl.udpConn.Close()
 			}
@@ -285,6 +330,44 @@ func (s *Service) bindAllListeners(op errors.Op, resolved []resolvedListener) ([
 
 	for _, rl := range resolved {
 		bl := boundListener{resolved: rl}
+
+		// Create handler if configured
+		if rl.config.Handler != "" {
+			factory, ok := handlers.Get(rl.config.Handler)
+			if !ok {
+				cleanup()
+				return nil, errors.New(op).Msgf("unknown handler '%s' for listener %s (available: %v)",
+					rl.config.Handler, rl.config.Name, handlers.List())
+			}
+
+			// Build handler config with logging functions
+			handlerCfg := make(map[string]any)
+			for k, v := range rl.config.HandlerConfig {
+				handlerCfg[k] = v
+			}
+			// Inject logging functions
+			handlerCfg["log_debug"] = func(format string, args ...any) {
+				s.Logger.DebugWith().Str("handler", rl.config.Handler).Msgf(format, args...)
+			}
+			handlerCfg["log_info"] = func(format string, args ...any) {
+				s.Logger.InfoWith().Str("handler", rl.config.Handler).Msgf(format, args...)
+			}
+			handlerCfg["log_error"] = func(format string, args ...any) {
+				s.Logger.ErrorWith().Str("handler", rl.config.Handler).Msgf(format, args...)
+			}
+
+			h, err := factory(handlerCfg)
+			if err != nil {
+				cleanup()
+				return nil, errors.New(op).Err(err).Msgf("failed to create handler '%s' for listener %s",
+					rl.config.Handler, rl.config.Name)
+			}
+			bl.handler = h
+			s.Logger.DebugWith().
+				Str("name", rl.config.Name).
+				Str("handler", rl.config.Handler).
+				Msg("Handler created for listener")
+		}
 
 		switch rl.proto {
 		case "udp":
@@ -317,33 +400,19 @@ func (s *Service) bindAllListeners(op errors.Op, resolved []resolvedListener) ([
 }
 
 // launchUDPListenerWithConn starts a UDP listener goroutine with a pre-bound connection.
-func (s *Service) launchUDPListenerWithConn(run *runState, rl resolvedListener, conn *net.UDPConn, ctx context.Context) {
+func (s *Service) launchUDPListenerWithConn(ctx context.Context, run *runState, rl resolvedListener, conn *net.UDPConn, handler handlers.PacketHandler) {
 	workerName := fmt.Sprintf("udp_%s", rl.config.Name)
 
 	run.wg.Add(1)
 	go func() {
 		defer run.wg.Done()
 		defer func() {
-			if r := recover(); r != nil {
-				s.Logger.ErrorWith().
-					Str("worker", workerName).
-					Str("panic", fmt.Sprintf("%v", r)).
-					Msg("Listener panicked")
+			if handler != nil {
+				if err := handler.Close(); err != nil {
+					s.Logger.ErrorWith().Err(err).Str("worker", workerName).Msg("Error closing handler")
+				}
 			}
 		}()
-		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener starting")
-		s.runUDPListener(run, rl, conn, ctx)
-		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener stopped")
-	}()
-}
-
-// launchTCPListenerWithConn starts a TCP listener goroutine with a pre-bound listener.
-func (s *Service) launchTCPListenerWithConn(run *runState, rl resolvedListener, ln *net.TCPListener, ctx context.Context) {
-	workerName := fmt.Sprintf("tcp_%s", rl.config.Name)
-
-	run.wg.Add(1)
-	go func() {
-		defer run.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				s.Logger.ErrorWith().
@@ -353,7 +422,35 @@ func (s *Service) launchTCPListenerWithConn(run *runState, rl resolvedListener, 
 			}
 		}()
 		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener starting")
-		s.runTCPListener(run, rl, ln, ctx)
+		s.runUDPListener(ctx, run, rl, conn, handler)
+		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener stopped")
+	}()
+}
+
+// launchTCPListenerWithConn starts a TCP listener goroutine with a pre-bound listener.
+func (s *Service) launchTCPListenerWithConn(ctx context.Context, run *runState, rl resolvedListener, ln *net.TCPListener, handler handlers.PacketHandler) {
+	workerName := fmt.Sprintf("tcp_%s", rl.config.Name)
+
+	run.wg.Add(1)
+	go func() {
+		defer run.wg.Done()
+		defer func() {
+			if handler != nil {
+				if err := handler.Close(); err != nil {
+					s.Logger.ErrorWith().Err(err).Str("worker", workerName).Msg("Error closing handler")
+				}
+			}
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				s.Logger.ErrorWith().
+					Str("worker", workerName).
+					Str("panic", fmt.Sprintf("%v", r)).
+					Msg("Listener panicked")
+			}
+		}()
+		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener starting")
+		s.runTCPListener(ctx, run, rl, ln, handler)
 		s.Logger.InfoWith().Str("worker", workerName).Msg("Listener stopped")
 	}()
 }
@@ -420,24 +517,27 @@ func (s *Service) resolveAddresses(op errors.Op, configs []types.ListenerConfig)
 func (s *Service) Stop() error {
 	const op errors.Op = "listeners.Service.Stop"
 
+	// Phase 1: Acquire lock, validate state, initiate shutdown
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	currentState := s.getState()
 	switch currentState {
 	case stateUninitialized, stateInitialized:
 		s.Logger.InfoWith().Msg("Listeners not started, skipping stop")
+		s.mu.Unlock()
 		return nil
 	case stateStarting:
-		// Wait briefly for startup to complete, or force stop
+		// Stop() called during startup - set state so Start() Phase 4 will abort
 		s.Logger.WarnWith().Msg("Stop called during startup, attempting to stop")
 	case stateRunning:
 		// Normal case
 	case stateStopping:
 		s.Logger.InfoWith().Msg("Already stopping, skipping")
+		s.mu.Unlock()
 		return nil
 	case stateStopped:
 		s.Logger.InfoWith().Msg("Already stopped")
+		s.mu.Unlock()
 		return nil
 	}
 
@@ -446,9 +546,17 @@ func (s *Service) Stop() error {
 	run := s.currentRun
 	if run == nil {
 		s.setState(stateStopped)
+		s.mu.Unlock()
 		return nil
 	}
 
+	// Clear currentRun while holding lock to prevent races
+	s.currentRun = nil
+
+	// Release mutex before potentially blocking operations
+	s.mu.Unlock()
+
+	// Phase 2: Signal shutdown and close connections (no mutex held)
 	s.Logger.InfoWith().Msg("Stopping listeners...")
 
 	// Use stopOnce to ensure shutdown channel is closed exactly once
@@ -475,7 +583,7 @@ func (s *Service) Stop() error {
 		}
 	}
 
-	// Wait for all goroutines to finish with a timeout
+	// Phase 3: Wait for goroutines with timeout (no mutex held)
 	done := make(chan struct{})
 	go func() {
 		run.wg.Wait()
@@ -492,8 +600,10 @@ func (s *Service) Stop() error {
 		s.Logger.WarnWith().Msg("Timeout waiting for listeners to stop, some goroutines may still be running")
 	}
 
-	s.currentRun = nil
+	// Phase 4: Final state transition (brief lock)
+	s.mu.Lock()
 	s.setState(stateStopped)
+	s.mu.Unlock()
 
 	return nil
 }
