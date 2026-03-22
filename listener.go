@@ -63,6 +63,11 @@ func (s *Service) runUDPListener(ctx context.Context, run *runState, rl resolved
 				if errors.As(err, &netErr) && netErr.Timeout() {
 					continue
 				}
+				// Suppress "use of closed network connection" - expected during shutdown
+				if errors.Is(err, net.ErrClosed) {
+					s.Logger.DebugWith().Str("name", cfg.Name).Msg("UDP connection closed")
+					return
+				}
 				s.Logger.ErrorWith().Err(err).Str("name", cfg.Name).Msg("UDP read error")
 				continue
 			}
@@ -176,6 +181,10 @@ func (s *Service) runTCPListener(ctx context.Context, run *runState, rl resolved
 				var netErr net.Error
 				if errors.As(err, &netErr) && netErr.Timeout() {
 					continue
+				}
+				// Suppress "use of closed network connection" - expected during shutdown
+				if errors.Is(err, net.ErrClosed) {
+					return
 				}
 				select {
 				case <-run.shutdownChannel:
